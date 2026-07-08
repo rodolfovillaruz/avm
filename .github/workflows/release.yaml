@@ -1,0 +1,234 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: avm
+
+jobs:
+  # ── Validate the tag matches Cargo.toml version ─────────────────────────────
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract Cargo.toml version
+        id: cargo_version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare tag vs Cargo.toml
+        run: |
+          TAG="${{ github.ref_name }}"
+          CARGO="${{ steps.cargo_version.outputs.version }}"
+          if [[ "$TAG" != "$CARGO" ]]; then
+            echo "::error::Git tag ($TAG) does not match Cargo.toml version ($CARGO)"
+            exit 1
+          fi
+
+  # ── Build static binaries ───────────────────────────────────────────────────
+  build:
+    name: Build — ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static x86-64 (musl)
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: false
+            archive_suffix: linux-amd64
+
+          # Static ARM64 (musl, cross-compiled)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            archive_suffix: linux-arm64
+
+          # GNU x86-64 (wider glibc compatibility)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            archive_suffix: linux-amd64-gnu
+
+          # Windows x86-64 (MSVC)
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            archive_suffix: windows-amd64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── Toolchain ────────────────────────────────────────────────────────────
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── musl libc for native builds ──────────────────────────────────────────
+      - name: Install musl-tools (x86_64-musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools ca-certificates
+
+      # ── Cross for cross-compiled targets ─────────────────────────────────────
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      # ── Cache ────────────────────────────────────────────────────────────────
+      - name: Cache cargo registry & build artefacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      # ── Compile ──────────────────────────────────────────────────────────────
+      - name: Build (cargo)
+        if: matrix.cross == false
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      # ── Package ──────────────────────────────────────────────────────────────
+      # Uses bash on all platforms (Git Bash on Windows).
+      # Windows  → .zip  via 7z  (pre-installed on windows-latest)
+      # Linux    → .tar.gz via tar
+      - name: Create release archive
+        id: package
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            BINARY="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe"
+            ARCHIVE="${{ env.BINARY_NAME }}-${TAG}-${{ matrix.archive_suffix }}.zip"
+            mkdir staging
+            cp "$BINARY" staging/
+            cp README.md staging/
+            7z a "$ARCHIVE" ./staging/*
+          else
+            BINARY="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
+            ARCHIVE="${{ env.BINARY_NAME }}-${TAG}-${{ matrix.archive_suffix }}.tar.gz"
+            mkdir -p staging
+            cp "$BINARY" staging/
+            cp README.md staging/
+            tar -czf "$ARCHIVE" -C staging .
+          fi
+
+          rm -rf staging
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SHA-256 checksum
+        shell: bash
+        run: |
+          sha256sum "${{ steps.package.outputs.archive }}" \
+            > "${{ steps.package.outputs.archive }}.sha256"
+
+      # ── Upload artefacts for the next job ────────────────────────────────────
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          retention-days: 1
+
+  # ── Publish to crates.io ────────────────────────────────────────────────────
+  publish:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+  # ── Create GitHub Release ───────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all release artefacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${{ github.ref_name }}"
+          cat <<EOF > release-notes.md
+          ### Installation
+
+          #### via \`cargo install\`
+          \`\`\`bash
+          cargo install ec2-vm --locked
+          \`\`\`
+
+          #### Pre-built binary (Linux)
+          \`\`\`bash
+          # x86-64 (static, musl)
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/avm-${TAG}-linux-amd64.tar.gz | tar -xz
+          sudo mv avm /usr/local/bin/
+
+          # ARM64 (static, musl)
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/avm-${TAG}-linux-arm64.tar.gz | tar -xz
+          sudo mv avm /usr/local/bin/
+          \`\`\`
+
+          #### Pre-built binary (Windows)
+          \`\`\`powershell
+          # x86-64
+          Invoke-WebRequest -Uri https://github.com/${{ github.repository }}/releases/download/${TAG}/avm-${TAG}-windows-amd64.zip -OutFile avm.zip
+          Expand-Archive avm.zip -DestinationPath .
+          \`\`\`
+
+          ### Checksums
+          \`\`\`
+          $(cat dist/*.sha256)
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: "avm ${{ github.ref_name }}"
+          body_path: release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
